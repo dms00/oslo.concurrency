@@ -81,9 +81,48 @@ class ProcessExecutionError(Exception):
         super(ProcessExecutionError, self).__init__(message)
 
 
+class ProcessTerminationError(Exception):
+    def __init__(self, message=None):
+        super(ProcessTerminationError, self).__init__(message)
+
+
+class TimeoutError(Exception):
+    def __init__(self, message=None):
+        super(TimeoutError, self).__init__(message)
+
+
 class NoRootWrapSpecified(Exception):
     def __init__(self, message=None):
         super(NoRootWrapSpecified, self).__init__(message)
+
+
+def _alarm_handler(signum, frame):
+    raise TimeoutError('Timeout Exceeded')
+
+
+def _subprocess_terminate(pobj, term_delay):
+
+    def _test_termination(secs_to_test):
+        rc = pobj.poll()
+
+        while secs_to_test > 0 and rc is None:
+            delay_between_poll = 0.2
+            time.sleep(delay_between_poll)
+            secs_to_test -= delay_between_poll
+            rc = pobj.poll()
+
+        return rc
+
+    pobj.terminate()
+    if _test_termination(term_delay) is not None:
+        return
+
+    pobj.kill()
+    if _test_termination(term_delay) is not None:
+        return
+
+    # We can't seem to kill it. Throw exception...
+    raise ProcessTerminationError("Unable to terminate subprocess")
 
 
 def _subprocess_setup():
@@ -144,11 +183,25 @@ def execute(*cmd, **kwargs):
                             last attempt, and LOG_ALL_ERRORS requires
                             logging on each occurence of an error.
     :type log_errors:       integer.
+    :param timeout:         Timeout in seconds for subprocess exit. If
+                            subprocess does not complete before timeout
+                            expiration, the subprocess is sent a SIGTERM.
+                            If SIGTERM doesn't kill it, a SIGKILL is sent.
+    :type timeout:          integer.
+    :param terminate_wait:  Time in seconds to wait for a timed-out process
+                            to terminate after sending the TERM and KILL
+                            signals. This parameter is only meaningful when
+                            timeout is enabled. Default = 3.
+    :type terminate_wait:   integer.
     :returns:               (stdout, stderr) from process execution
     :raises:                :class:`UnknownArgumentError` on
                             receiving unknown arguments
     :raises:                :class:`ProcessExecutionError`
     :raises:                :class:`OSError`
+    :raises:                :class:`TimeoutError` if subprocess was terminated
+                            due to timeout
+    :raises:                :class:`ProcessTerminationError` if subprocess
+                            could not be terminated
     """
 
     cwd = kwargs.pop('cwd', None)
@@ -163,6 +216,8 @@ def execute(*cmd, **kwargs):
     shell = kwargs.pop('shell', False)
     loglevel = kwargs.pop('loglevel', logging.DEBUG)
     log_errors = kwargs.pop('log_errors', None)
+    timeout = kwargs.pop('timeout', None)
+    terminate_wait = kwargs.pop('terminate_wait', 3)
 
     if isinstance(check_exit_code, bool):
         ignore_exit_code = not check_exit_code
@@ -201,6 +256,10 @@ def execute(*cmd, **kwargs):
                 preexec_fn = _subprocess_setup
                 close_fds = True
 
+            if timeout:
+                orig_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+                signal.alarm(timeout)
+
             obj = subprocess.Popen(cmd,
                                    stdin=_PIPE,
                                    stdout=_PIPE,
@@ -213,11 +272,19 @@ def execute(*cmd, **kwargs):
 
             result = obj.communicate(process_input)
 
+            # there's a small race condition here where the process could
+            # complete but the alarm signal triggers before we can turn
+            # if off. So cancel the alarm first to reduce this window of
+            # opportunity
+            if timeout:
+                signal.alarm(0)
+
             obj.stdin.close()  # pylint: disable=E1101
             _returncode = obj.returncode  # pylint: disable=E1101
             end_time = time.time() - start_time
             LOG.log(loglevel, 'CMD "%s" returned: %s in %0.3fs' %
                     (sanitized_cmd, _returncode, end_time))
+
             if not ignore_exit_code and _returncode not in check_exit_code:
                 (stdout, stderr) = result
                 sanitized_stdout = strutils.mask_password(stdout)
@@ -228,7 +295,12 @@ def execute(*cmd, **kwargs):
                                             cmd=sanitized_cmd)
             return result
 
-        except (ProcessExecutionError, OSError) as err:
+        except (ProcessExecutionError, TimeoutError, OSError) as err:
+            # NOTE(darren): we don't want an alarm signal to fire while we're
+            #               in this exception handler
+            if timeout:
+                signal.alarm(0)
+
             # if we want to always log the errors or if this is
             # the final attempt that failed and we want to log that.
             if log_errors == LOG_ALL_ERRORS or (
@@ -242,11 +314,20 @@ def execute(*cmd, **kwargs):
                                                "code": err.exit_code,
                                                "stdout": err.stdout,
                                                "stderr": err.stderr})
+                elif isinstance(err, TimeoutError):
+                    format = _('Got a timeout error\ncommand: %(cmd)r')
+                    LOG.log(loglevel, format, {"cmd": sanitized_cmd})
                 else:
                     format = _('Got an OSError\ncommand: %(cmd)r\n'
                                'errno: %(errno)r')
                     LOG.log(loglevel, format, {"cmd": sanitized_cmd,
                                                "errno": err.errno})
+
+            # NOTE(darren): if we get a timeout exeception, we have to clean
+            #               up the offending subprocess and restore the alarm
+            #               signal handler
+            if isinstance(err, TimeoutError):
+                _subprocess_terminate(obj, terminate_wait)
 
             if not attempts:
                 LOG.log(loglevel, _('%r failed. Not Retrying.'),
@@ -257,7 +338,17 @@ def execute(*cmd, **kwargs):
                         sanitized_cmd)
                 if delay_on_retry:
                     time.sleep(random.randint(20, 200) / 100.0)
+
         finally:
+            # NOTE(darren): restore original signal handler and turn off
+            #               alarm timer. Turning off alarm was probably
+            #               already done, but call again in 'finally' just
+            #               to be sure -- e.g., in case someone were to add
+            #               another exception handler that doesn't do this.
+            if timeout:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, orig_handler)
+
             # NOTE(termie): this appears to be necessary to let the subprocess
             #               call clean something up in between calls, without
             #               it two execute calls in a row hangs the second one
