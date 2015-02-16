@@ -60,6 +60,28 @@ class UtilsTest(test_base.BaseTestCase):
                                                         mock_cpu_count):
         self.assertEqual(1, processutils.get_worker_count())
 
+    # test case where sigterm and sigkill fail
+    def test_subprocess_terminate_fail(self):
+        pobj = FakePopenObject(returncode=1, exit_after_terminate=False,
+                               exit_after_kill=False)
+        self.assertRaises(processutils.ProcessTerminationError,
+                          processutils._subprocess_terminate,
+                          pobj, 1)
+
+    # test case where sigterm succeeds
+    def test_subprocess_terminate_succeed1(self):
+        pobj = FakePopenObject(returncode=0, exit_after_terminate=True,
+                               exit_after_kill=False)
+        ret = processutils._subprocess_terminate(pobj, 1)
+        self.assertIsNone(ret)
+
+    # test case where sigterm fails but sigkill succeeds
+    def test_subprocess_terminate_succeed2(self):
+        pobj = FakePopenObject(returncode=0, exit_after_terminate=False,
+                               exit_after_kill=True)
+        ret = processutils._subprocess_terminate(pobj, 1)
+        self.assertIsNone(ret)
+
 
 class ProcessExecutionErrorTest(test_base.BaseTestCase):
 
@@ -161,6 +183,12 @@ exit 1
                           processutils.execute,
                           '/usr/bin/env', 'true',
                           this_is_not_a_valid_kwarg=True)
+
+    def test_process_timeout_error(self):
+        self.assertRaises(processutils.TimeoutError,
+                          processutils.execute,
+                          '/bin/sleep', '5',
+                          timeout=1)
 
     def test_check_exit_code_boolean(self):
         processutils.execute('/usr/bin/env', 'false', check_exit_code=False)
@@ -423,6 +451,31 @@ class TryCmdTestCase(test_base.BaseTestCase):
                                    discard_warnings=True)
         self.assertIsNotNone(o)
         self.assertEqual('', e)
+
+
+# Fake Popen object needs to have poll, terminate and kill methods
+# for the _subprocess_terminate method
+class FakePopenObject(object):
+    def __init__(self, *args, **kwds):
+        self.returncode = None
+        self.returncode_on_exit = kwds.get('returncode', 0)
+        self.exit_after_terminate = kwds.get('exit_after_terminate', True)
+        self.exit_after_kill = kwds.get('exit_after_kill', True)
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        if self.exit_after_terminate:
+            self.returncode = self.returncode_on_exit
+        else:
+            self.returncode = None
+
+    def kill(self):
+        if self.exit_after_kill:
+            self.returncode = self.returncode_on_exit
+        else:
+            self.returncode = None
 
 
 class FakeSshChannel(object):
